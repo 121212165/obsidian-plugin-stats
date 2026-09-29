@@ -102,7 +102,12 @@ module.exports = class PluginStats extends Plugin {
       const today = new Date().toISOString().slice(0, 10);
       const last = Object.keys(this.snapshots).sort().pop();
       if (last !== today) {
-        setTimeout(() => this.refreshAll().then(() => this.rerenderViews()).catch(() => {}), 8000);
+        setTimeout(() => this.refreshAll().then(async () => {
+          this.rerenderViews();
+          if (new Date().getDay() === 1) {
+            try { await this.generateWeekly({ silent: true }); } catch (e) {}
+          }
+        }).catch(() => {}), 8000);
       }
     }
   }
@@ -211,7 +216,7 @@ module.exports = class PluginStats extends Plugin {
   }
 
   /** 生成 Markdown 周报笔记 */
-  async generateWeekly() {
+  async generateWeekly(opts) {
     const snap = this.snapshots;
     const days = Object.keys(snap).sort();
     if (days.length < 2) { new Notice("快照不足 2 天，明天再来生成周报"); return; }
@@ -261,7 +266,18 @@ module.exports = class PluginStats extends Plugin {
         lines.push(`- ${id}：#${rank}（${all[id] ? all[id].downloads : "—"}）`);
       }
     }
+    // 蓝海雷达 Top3（有数据时）
+    if (this.cache.opportunity && this.cache.opportunity.length) {
+      lines.push("", "## 蓝海雷达 Top3", "");
+      for (const o of this.cache.opportunity.slice(0, 3)) {
+        lines.push(`- ${o.cat}：${o.score}分（${o.n}个插件 · 中位${o.med} · 头部占${Math.round(o.top1 * 100)}% · 新版吸引${Math.round((o.fresh || 0) * 100)}%）`);
+      }
+    }
     const f = await this.app.vault.create(`插件周报-${today}.md`, lines.join("\n") + "\n");
+    if (opts && opts.silent) {
+      new Notice("本周插件周报已自动生成");
+      return;
+    }
     new Notice("周报已生成");
     this.app.workspace.getLeaf("tab").openFile(f);
   }
