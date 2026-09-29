@@ -1,7 +1,7 @@
 {
   "id": "plugin-stats",
   "name": "Plugin Stats",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "minAppVersion": "1.4.0",
   "description": "Download dashboard for your published plugins: GitHub release counts, daily snapshots with deltas, and official community-directory stats detection.",
   "author": "121212165",

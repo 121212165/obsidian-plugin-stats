@@ -9,6 +9,23 @@ const { Plugin, ItemView, Notice, PluginSettingTab, Setting, requestUrl } = requ
 
 const VIEW_TYPE = "plugin-stats-view";
 const OFFICIAL_STATS_URL = "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugin-stats.json";
+const CP_LIST_URL = "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json";
+
+// ---- 内置领域分类规则（顺序即优先级；settings.domainJson 可整体替换） ----
+const DOMAIN_RULES = [
+  ["AI 与自动化", ["ai", "gpt", "llm", "chatgpt", "copilot", "assistant", "automation", "templater", "quickadd", "macro", "chatbot"]],
+  ["任务与项目", ["task", "todo", "project", "kanban", "gtd", "planner", "checklist", "habit", "tracker", "reminder", "issue"]],
+  ["日历与日记", ["calendar", "daily", "journal", "diary", "periodic", "heatmap", "pomodoro", "schedule", "appointment"]],
+  ["写作与小说", ["writing", "write", "writer", "novel", "fiction", "prose", "draft", "longform", "manuscript", "screenplay", "word count", "typewriter"]],
+  ["知识管理与图谱", ["graph", "backlink", "zettel", "knowledge", "mindmap", "outline", "canvas", "whiteboard", "excalidraw", "spaced", "flashcard", "anki", "memory", "moc"]],
+  ["查询与可视化", ["dataview", "query", "chart", "dashboard", "table", "plot", "diagram", "mermaid", "base", "database", "notion"]],
+  ["开发与代码", ["code", "developer", "snippet", "syntax", "programming", "git", "github", "terminal", "shell", "script", "api", "debug", "python", "javascript", "sql"]],
+  ["同步与导出", ["sync", "publish", "export", "pandoc", "pdf", "word", "docx", "hugo", "vitepress", "quartz", "static", "upload", "backup", "webdav", "s3"]],
+  ["学习与语言", ["learn", "study", "vocabulary", "language", "dictionary", "translate", "review", "exam", "textbook"]],
+  ["媒体与外观", ["image", "audio", "video", "music", "media", "gallery", "banner", "icon", "theme", "css", "font", "color", "appearance", "embed", "banner"]],
+  ["效率与界面", ["hotkey", "shortcut", "sidebar", "status", "command", "menu", "pane", "layout", "focus", "wysiwyg", "swiper", "launcher", "starred", "bookmark", "recent"]],
+  ["搜索与链接", ["search", "omnisearch", "find", "navigate", "jump", "link", "url", "web", "browser", "embed web"]],
+];
 
 const DEFAULT_SETTINGS = {
   owner: "121212165",
@@ -17,6 +34,7 @@ const DEFAULT_SETTINGS = {
   watchlist: "templater-obsidian, dataview, periodic-notes",
   autoSnapshot: true,
   goalsJson: "{}", // {"仓库名": 目标下载量}
+  domainJson: "", // 领域分类规则 JSON [["领域名",["关键词",...]],...]，整体替换内置规则
 };
 
 function fmt(n) {
@@ -118,6 +136,48 @@ module.exports = class PluginStats extends Plugin {
   /** 某仓库目标（goalsJson） */
   goalOf(repo) {
     try { return JSON.parse(this.settings.goalsJson || "{}")[repo] || 0; } catch (e) { return 0; }
+  }
+
+  /** 领域规则：settings.domainJson 可整体替换内置规则 */
+  domainRules() {
+    if (this.settings.domainJson) {
+      try {
+        const arr = JSON.parse(this.settings.domainJson);
+        if (Array.isArray(arr) && arr.length && arr.every((r) => Array.isArray(r) && r[0] && Array.isArray(r[1]))) return arr;
+      } catch (e) {}
+    }
+    return DOMAIN_RULES;
+  }
+
+  /** 按 名称+简介 关键词打分分类；无命中归「其他」 */
+  classify(name, desc) {
+    const text = ((name || "") + " " + (desc || "")).toLowerCase();
+    let best = { cat: "其他", score: 0 };
+    for (const [cat, kws] of this.domainRules()) {
+      let score = 0;
+      for (const kw of kws) {
+        if (text.includes(kw)) score += kw.length >= 5 ? 2 : 1;
+      }
+      if (score > best.score) best = { cat, score };
+    }
+    return best.cat;
+  }
+
+  /** 拉取插件元数据并构建领域索引 {cat: [{id, dl}]}（下载量降序） */
+  async buildDomains() {
+    const meta = await this.fetchJSON(CP_LIST_URL, "cplist");
+    if (meta) this.cache.meta = meta;
+    const list = this.cache.meta || [];
+    const all = this.cache.allStats || {};
+    const domains = {};
+    for (const e of list) {
+      const st = all[e.id];
+      if (!st) continue; // stats 与目录列表交集
+      const cat = this.classify(e.name, e.description);
+      (domains[cat] = domains[cat] || []).push({ id: e.id, name: e.name, dl: st.downloads || 0 });
+    }
+    for (const cat of Object.keys(domains)) domains[cat].sort((a, b) => b.dl - a.dl);
+    this.cache.domains = domains;
   }
 
   /** 生成 Markdown 周报笔记 */
@@ -257,6 +317,7 @@ module.exports = class PluginStats extends Plugin {
         if (stats[id]) official[id] = { total: stats[id].downloads, versions: Object.keys(stats[id]).filter((k) => !["downloads", "updated"].includes(k)).length };
       }
       this.cache.official = official;
+      if (this.cache.allStats) await this.buildDomains();
     } catch (e) {
       this.cache.officialError = String(e.message || e);
     }
@@ -455,32 +516,109 @@ class StatsView extends ItemView {
       }
     }
 
-    // ---- 全量排行榜（搜索） ----
+    // ---- 领域细分 ----
+    const domains = plugin.cache.domains;
+    if (domains && Object.keys(domains).length) {
+      const catNames = Object.keys(domains).sort((a, b) => domains[b].length - domains[a].length);
+      const dWrap = contentEl.createDiv();
+      dWrap.style.cssText = "border:1px solid var(--background-modifier-border); border-radius:8px; padding:8px; margin-bottom:8px; font-size:12px;";
+      dWrap.createEl("div", {
+        text: "🗂 领域细分（" + catNames.length + " 个领域 · 关键词分类，可在设置自定义）",
+        attr: { style: "font-weight:600; margin-bottom:4px;" },
+      });
+      const metaById = {};
+      for (const e of plugin.cache.meta || []) metaById[e.id] = e;
+      const myIds = plugin.idList().filter((id) => all[id]);
+      for (const id of myIds) {
+        const meta = metaById[id] || {};
+        const cat = plugin.classify(meta.name, meta.description);
+        const list2 = domains[cat] || [];
+        const idx = list2.findIndex((x) => x.id === id);
+        const med = list2.length ? list2[Math.floor(list2.length / 2)].dl : 0;
+        const top = list2.slice(0, 3).map((x) => x.id).join(", ");
+        const row = dWrap.createDiv();
+        row.style.cssText = "padding:3px 0; border-top:1px solid var(--background-modifier-border);";
+        row.createEl("div", {
+          text: id + " → " + cat + "：领域内 #" + (idx + 1) + "/" + list2.length + " · 领域中位 " + fmt(med),
+          attr: { style: "font-weight:600;" },
+        });
+        row.createEl("div", { text: "领域头部：" + top, attr: { style: "color:var(--text-muted);" } });
+      }
+      if (!myIds.length) {
+        dWrap.createEl("div", { text: "插件收录后这里显示其领域内排名。", attr: { style: "color:var(--text-muted);" } });
+      }
+      // 各领域规模条（点击查看该领域 Top10）
+      const scale = dWrap.createDiv();
+      scale.style.marginTop = "4px";
+      const maxN = Math.max(...catNames.map((c) => domains[c].length), 1);
+      for (const cat of catNames) {
+        const list2 = domains[cat];
+        const med = list2[Math.floor(list2.length / 2)].dl;
+        const row = scale.createDiv();
+        row.style.cssText = "display:flex; align-items:center; gap:6px; margin:2px 0; cursor:pointer;";
+        row.createEl("span", { text: cat, attr: { style: "width:110px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;" } });
+        const track = row.createDiv();
+        track.style.cssText = "flex:1; height:8px; background:var(--background-secondary); border-radius:4px; overflow:hidden;";
+        const fill = track.createDiv();
+        fill.style.cssText = "height:100%; width:" + Math.max(2, (list2.length / maxN) * 100) + "%; background:var(--interactive-accent); opacity:0.7;";
+        row.createEl("span", {
+          text: list2.length + "个 · 中位" + fmt(med),
+          attr: { style: "width:110px; text-align:right; color:var(--text-muted);" },
+        });
+        row.title = "点击查看该领域 Top10";
+        row.onclick = () => { domainSel.value = cat; renderLb("", cat); lbWrap.open = true; };
+      }
+    }
+
+    // ---- 全量排行榜（搜索 + 领域筛选） ----
     if (all) {
       const lbWrap = contentEl.createEl("details");
       lbWrap.style.marginBottom = "8px";
-      lbWrap.createEl("summary", { text: "🏅 全量排行榜（搜索任意插件）", attr: { style: "cursor:pointer; font-weight:600; font-size:13px;" } });
-      const search = lbWrap.createEl("input", { type: "text", placeholder: "搜插件 id，如 dataview" });
-      search.style.cssText = "width:100%; margin:6px 0; padding:4px 8px;";
+      lbWrap.createEl("summary", { text: "🏅 全量排行榜（搜索 / 领域筛选）", attr: { style: "cursor:pointer; font-weight:600; font-size:13px;" } });
+      const controls = lbWrap.createDiv();
+      controls.style.cssText = "display:flex; gap:6px; margin:6px 0;";
+      const search = controls.createEl("input", { type: "text", placeholder: "搜插件 id，如 dataview" });
+      search.style.cssText = "flex:1; padding:4px 8px;";
+      const domainSel = controls.createEl("select");
+      domainSel.style.cssText = "width:140px; font-size:12px;";
+      domainSel.createEl("option", { value: "", text: "全部领域" });
+      const domains2 = plugin.cache.domains || {};
+      for (const cat of Object.keys(domains2).sort()) {
+        domainSel.createEl("option", { value: cat, text: cat + " (" + domains2[cat].length + ")" });
+      }
       const lbList = lbWrap.createDiv();
       lbList.style.cssText = "max-height:240px; overflow-y:auto; font-size:12px;";
-      const renderList = (kw) => {
+      const renderLb = (kw, cat) => {
         lbList.empty();
-        const entries = Object.entries(all).map(([id, v]) => [id, v.downloads || 0]).sort((a, b) => b[1] - a[1]);
         let shown = 0;
-        for (let i = 0; i < entries.length && shown < 30; i++) {
-          const [id, dl] = entries[i];
-          if (kw && !id.includes(kw)) continue;
-          shown++;
-          const row = lbList.createDiv();
-          row.style.cssText = "display:flex; justify-content:space-between; padding:2px 6px;";
-          row.createEl("span", { text: `#${i + 1} ${id}` });
-          row.createEl("span", { text: fmt(dl), attr: { style: "color:var(--text-muted);" } });
+        if (cat && domains2[cat]) {
+          const entries = domains2[cat].map((x) => [x.id, x.dl]);
+          for (let i = 0; i < entries.length && shown < 30; i++) {
+            const id = entries[i][0], dl = entries[i][1];
+            if (kw && !id.includes(kw)) continue;
+            shown++;
+            const row = lbList.createDiv();
+            row.style.cssText = "display:flex; justify-content:space-between; padding:2px 6px;";
+            row.createEl("span", { text: "#" + (i + 1) + " " + id });
+            row.createEl("span", { text: fmt(dl), attr: { style: "color:var(--text-muted);" } });
+          }
+        } else {
+          const entries = Object.entries(all).map(([id, v]) => [id, v.downloads || 0]).sort((a, b) => b[1] - a[1]);
+          for (let i = 0; i < entries.length && shown < 30; i++) {
+            const id = entries[i][0], dl = entries[i][1];
+            if (kw && !id.includes(kw)) continue;
+            shown++;
+            const row = lbList.createDiv();
+            row.style.cssText = "display:flex; justify-content:space-between; padding:2px 6px;";
+            row.createEl("span", { text: "#" + (i + 1) + " " + id });
+            row.createEl("span", { text: fmt(dl), attr: { style: "color:var(--text-muted);" } });
+          }
         }
         if (!shown) lbList.createEl("div", { text: "无匹配", attr: { style: "color:var(--text-muted); padding:4px 6px;" } });
       };
-      renderList("");
-      search.oninput = () => renderList(search.value.trim().toLowerCase());
+      renderLb("", "");
+      search.oninput = () => renderLb(search.value.trim().toLowerCase(), domainSel.value);
+      domainSel.onchange = () => renderLb(search.value.trim().toLowerCase(), domainSel.value);
     }
 
     const listEl = contentEl.createDiv();
@@ -627,6 +765,17 @@ class StatsSettingTab extends PluginSettingTab {
       t.setValue(this.plugin.settings.autoSnapshot).onChange(async (v) => {
         this.plugin.settings.autoSnapshot = v; await this.plugin.saveSettings();
       }));
+    new Setting(containerEl).setName("领域分类规则（JSON，可选）")
+      .setDesc('整体替换内置领域规则。格式 [["领域名",["关键词",...]],...]，按 名称+简介 关键词匹配。细分你的赛道，如 [["网文写作",["novel","fiction","fanqie"]]]')
+      .addTextArea((t) => {
+        t.setValue(this.plugin.settings.domainJson || "");
+        t.inputEl.style.minHeight = "100px";
+        t.inputEl.style.fontFamily = "monospace";
+        t.onChange(async (v) => {
+          this.plugin.settings.domainJson = v;
+          await this.plugin.saveSettings();
+        });
+      });
     new Setting(containerEl).setName("下载目标（JSON）")
       .setDesc('{"仓库名": 目标下载数}，如 {"obsidian-clipping-finder": 500}。面板显示进度条，达成时提醒一次')
       .addTextArea((t) => {
