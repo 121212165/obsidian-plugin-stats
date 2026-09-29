@@ -16,6 +16,7 @@ const DEFAULT_SETTINGS = {
   pluginIds: "clipping-finder, ai-flavor-checker, scan-card-box, daoyu-studio, qs8-panel, story-ledger, jev-decision-log, fanqie-drafter",
   watchlist: "templater-obsidian, dataview, periodic-notes",
   autoSnapshot: true,
+  goalsJson: "{}", // {"仓库名": 目标下载量}
 };
 
 function fmt(n) {
@@ -23,6 +24,29 @@ function fmt(n) {
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
 }
+function svgChart(series, w, h) {
+  // series 升序 [{d,total}]；总量折线（accent）+ 日增柱（faint）
+  if (series.length < 2) return null;
+  const deltas = series.map((x, i) => (i === 0 ? 0 : Math.max(0, x.total - series[i - 1].total)));
+  const tMin = Math.min(...series.map((x) => x.total)), tMax = Math.max(...series.map((x) => x.total));
+  const dMax = Math.max(...deltas, 1);
+  const px = (i) => 4 + (i / (series.length - 1)) * (w - 8);
+  const ty = (v) => h - 6 - ((v - tMin) / Math.max(1, tMax - tMin)) * (h - 20);
+  const dy = (v) => h - 6 - (v / dMax) * (h - 20) * 0.5;
+  const pts = series.map((x, i) => `${px(i)},${ty(x.total)}`).join(" ");
+  const bw = Math.max(1.5, (w - 8) / series.length - 1);
+  const bars = deltas.map((v, i) => `<rect x="${px(i) - bw / 2}" y="${dy(v)}" width="${bw}" height="${h - 6 - dy(v)}" fill="var(--text-faint)" opacity="0.45"/>`).join("");
+  const last = series[series.length - 1];
+  const first = series[0];
+  const up = last.total >= first.total;
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none">
+    ${bars}
+    <polyline points="${pts}" fill="none" stroke="var(--interactive-accent)" stroke-width="1.8"/>
+    <circle cx="${px(series.length - 1)}" cy="${ty(last.total)}" r="2.5" fill="var(--interactive-accent)"/>
+    <text x="${w - 4}" y="10" text-anchor="end" font-size="9" fill="${up ? "var(--text-success)" : "var(--text-error)"}">${up ? "+" : ""}${last.total - first.total}</text>
+  </svg>`;
+}
+
 function spark(history, width) {
   // history: [{d, total}] 升序；把总量映射成字符条
   if (history.length < 2) return "";
@@ -43,12 +67,15 @@ module.exports = class PluginStats extends Plugin {
     const saved = (await this.loadData()) || {};
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved.settings || saved);
     this.snapshots = saved.snapshot || {};
+    this.etags = saved.etags || {};        // ETag 缓存，省 GitHub API 配额
+    this.achieved = saved.achieved || {};  // 已达成目标的仓库
     this.cache = { repos: {}, official: null, ts: 0 };
 
     this.addRibbonIcon("line-chart", "插件下载看板", () => this.openView());
     this.addCommand({ id: "open-view", name: "打开下载看板", callback: () => this.openView() });
     this.addCommand({ id: "refresh", name: "刷新数据", callback: async () => { await this.refreshAll(); this.rerenderViews(); } });
     this.addCommand({ id: "export-snapshots", name: "导出快照 CSV", callback: () => this.exportSnapshots() });
+    this.addCommand({ id: "weekly-report", name: "生成 Markdown 周报", callback: () => this.generateWeekly() });
     this.addSettingTab(new StatsSettingTab(this.app, this));
     this.registerView(VIEW_TYPE, (leaf) => new StatsView(leaf, this));
 
@@ -65,7 +92,88 @@ module.exports = class PluginStats extends Plugin {
 
   /** settings 与 snapshot 合并落盘，避免两处互相覆盖 */
   async saveState() {
-    await this.saveData({ settings: this.settings, snapshot: this.snapshots });
+    await this.saveData({ settings: this.settings, snapshot: this.snapshots, etags: this.etags, achieved: this.achieved });
+  }
+
+  /** 带条件请求的 JSON 拉取：304 时返回 null（调用方沿用缓存） */
+  async fetchJSON(url, etagKey) {
+    const headers = { "User-Agent": "obsidian-plugin-stats" };
+    if (this.etags[etagKey]) headers["If-None-Match"] = this.etags[etagKey];
+    let res;
+    try {
+      res = await requestUrl({ url, headers });
+    } catch (e) {
+      if (e && (e.status === 304 || e.code === 304)) return null;
+      throw e;
+    }
+    if (res.status === 304) return null;
+    const etag = res.headers && (res.headers.etag || res.headers.ETag);
+    if (etag && etag !== this.etags[etagKey]) {
+      this.etags[etagKey] = etag;
+      await this.saveState();
+    }
+    return res.json;
+  }
+
+  /** 某仓库目标（goalsJson） */
+  goalOf(repo) {
+    try { return JSON.parse(this.settings.goalsJson || "{}")[repo] || 0; } catch (e) { return 0; }
+  }
+
+  /** 生成 Markdown 周报笔记 */
+  async generateWeekly() {
+    const snap = this.snapshots;
+    const days = Object.keys(snap).sort();
+    if (days.length < 2) { new Notice("快照不足 2 天，明天再来生成周报"); return; }
+    const today = days[days.length - 1];
+    const idx7 = Math.max(0, days.length - 8);
+    const weekStart = days[idx7];
+    const repos = this.repoList();
+    const all = this.cache.allStats || (await this.fetchJSON(OFFICIAL_STATS_URL, "official")) || null;
+    const lines = [
+      "# 插件周报 " + today,
+      "",
+      `统计区间：${weekStart} ~ ${today}（${Math.min(7, days.length - 1)} 天）`,
+      "",
+      "| 插件 | 当前总量 | 周增量 | 目标进度 |",
+      "|---|---|---|---|",
+    ];
+    const rows = [];
+    for (const repo of repos) {
+      const cur = snap[today][repo];
+      if (cur == null) continue;
+      const base = days[idx7][repo] != null ? days[idx7][repo] : snap[days[0]][repo];
+      const d7 = cur - base;
+      const goal = this.goalOf(repo);
+      const goalTxt = goal ? `${Math.round((cur / goal) * 100)}%` : "—";
+      rows.push({ repo, cur, d7 });
+      lines.push(`| ${repo} | ${cur} | +${d7} | ${goalTxt} |`);
+    }
+    lines.push("");
+    if (all) {
+      const ids = Object.keys(all);
+      const sorted = ids.map((k) => [k, all[k].downloads || 0]).sort((a, b) => b[1] - a[1]);
+      lines.push("## 官方目录排名", "");
+      for (const r of rows) {
+        const id = r.repo.replace(/^obsidian-/, "");
+        if (all[id]) {
+          const rank = sorted.findIndex(([k]) => k === id) + 1;
+          lines.push(`- ${id}：#${rank}/${ids.length}（官方 ${all[id].downloads}）`);
+        } else {
+          lines.push(`- ${id}：未收录`);
+        }
+      }
+      lines.push("");
+      const watch = this.settings.watchlist.split(",").map((x) => x.trim()).filter(Boolean);
+      lines.push("## 竞品对照", "");
+      for (const id of watch) {
+        const rank = sorted.findIndex(([k]) => k === id) + 1;
+        lines.push(`- ${id}：#${rank}（${all[id] ? all[id].downloads : "—"}）`);
+      }
+    }
+    const f = await this.app.vault.create(`插件周报-${today}.md`, lines.join("\n") + "\n");
+    new Notice("周报已生成");
+    this.app.workspace.getLeaf("tab").openFile(f);
   }
   async saveSettings() { await this.saveState(); }
 
@@ -118,11 +226,15 @@ module.exports = class PluginStats extends Plugin {
     const totals = {};
     for (const repo of this.repoList()) {
       try {
-        const res = await requestUrl({
-          url: `https://api.github.com/repos/${this.settings.owner}/${repo}/releases?per_page=100`,
-          headers: { "User-Agent": "obsidian-plugin-stats" },
-        });
-        const releases = res.json;
+        const releases = await this.fetchJSON(
+          `https://api.github.com/repos/${this.settings.owner}/${repo}/releases?per_page=100`,
+          "gh:" + repo
+        );
+        if (!releases) { // 304：沿用缓存
+          const old = this.cache.repos[repo];
+          if (old && old.total != null) totals[repo] = old.total;
+          continue;
+        }
         const perRelease = releases.map((r) => ({
           tag: r.tag_name,
           date: (r.published_at || "").slice(0, 10),
@@ -138,9 +250,8 @@ module.exports = class PluginStats extends Plugin {
     }
     // 官方目录收录检测 + 全量排行
     try {
-      const res = await requestUrl({ url: OFFICIAL_STATS_URL });
-      const stats = res.json;
-      this.cache.allStats = stats;
+      const stats = await this.fetchJSON(OFFICIAL_STATS_URL, "official");
+      if (stats) this.cache.allStats = stats;
       const official = {};
       for (const id of this.idList()) {
         if (stats[id]) official[id] = { total: stats[id].downloads, versions: Object.keys(stats[id]).filter((k) => !["downloads", "updated"].includes(k)).length };
@@ -151,6 +262,15 @@ module.exports = class PluginStats extends Plugin {
     }
     await this.saveSnapshot(totals);
     this.cache.ts = Date.now();
+    // 目标达成检测（每个目标只提醒一次）
+    for (const repo of Object.keys(totals)) {
+      const goal = this.goalOf(repo);
+      if (goal && totals[repo] >= goal && !this.achieved[repo + ":" + goal]) {
+        this.achieved[repo + ":" + goal] = true;
+        new Notice(`🎉 ${repo} 达成目标：${totals[repo]}/${goal} 下载！`);
+      }
+    }
+    await this.saveState();
   }
 
   /** 较前一次快照增量 */
@@ -194,6 +314,38 @@ class StatsView extends ItemView {
     };
     const exportBtn = bar.createEl("button", { text: "导出快照CSV" });
     exportBtn.onclick = () => plugin.exportSnapshots();
+    const reportBtn = bar.createEl("button", { text: "生成周报" });
+    reportBtn.onclick = async () => {
+      reportBtn.disabled = true;
+      await plugin.generateWeekly();
+      reportBtn.disabled = false;
+    };
+
+    // 区间切换 + 汇总趋势图
+    const histAll = plugin.history();
+    const allDays = Object.keys(histAll).sort();
+    this.range = this.range || 7;
+    const rangeEl = contentEl.createDiv();
+    rangeEl.style.cssText = "display:flex; gap:4px; align-items:center; margin-bottom:6px;";
+    rangeEl.createEl("span", { text: "区间", attr: { style: "font-size:12px; color:var(--text-muted);" } });
+    for (const r of [7, 30, 0]) {
+      const b = rangeEl.createEl("button", { text: r === 0 ? "全部" : r + "天" });
+      b.style.cssText = "padding:2px 8px; font-size:12px;" + (this.range === r ? "; background:var(--interactive-accent); color:var(--text-on-accent);" : "");
+      b.onclick = () => { this.range = r; this.render(); };
+    }
+    const chartDays = allDays.slice(this.range === 0 ? 0 : -this.range);
+    const totalsByDay = chartDays.map((d) => ({ d, total: Object.values(histAll[d] || {}).reduce((s, v) => s + (v || 0), 0) }));
+    const chartWrap = contentEl.createDiv();
+    chartWrap.style.cssText = "border:1px solid var(--background-modifier-border); border-radius:8px; padding:6px; margin-bottom:8px;";
+    chartWrap.createEl("div", { text: `全仓库总下载趋势（${chartDays.length} 个快照）`, attr: { style: "font-size:11px; color:var(--text-muted); margin-bottom:2px;" } });
+    const svgHost = chartWrap.createDiv();
+    if (svgChart(totalsByDay, 600, 90)) {
+      svgHost.innerHTML = svgChart(totalsByDay, 600, 90);
+      svgHost.title = totalsByDay.map((x) => `${x.d}: ${x.total}`).join("\n");
+    } else {
+      svgHost.setText("快照不足 2 天，明天开始出图");
+      svgHost.style.cssText = "color:var(--text-muted); font-size:12px; padding:20px; text-align:center;";
+    }
     const tsEl = bar.createEl("span", {
       text: plugin.cache.ts ? `更新于 ${new Date(plugin.cache.ts).toLocaleTimeString()}` : "未刷新",
       attr: { style: "color:var(--text-muted); font-size:12px;" },
@@ -296,6 +448,19 @@ class StatsView extends ItemView {
       if (d) parts.push(`自 ${d.sinceDate} 以来 +${d.since}`);
       deltaLine.setText(parts.length ? parts.join(" ｜ ") : "首次快照，明天开始有增量");
 
+      // 目标进度条
+      const goal = plugin.goalOf(repo);
+      if (goal) {
+        const pct = Math.min(100, Math.round((data.total / goal) * 100));
+        const gw = item.createDiv();
+        gw.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0; font-size:11px; color:var(--text-muted);";
+        const track = gw.createDiv();
+        track.style.cssText = "flex:1; height:6px; background:var(--background-modifier-border); border-radius:3px; overflow:hidden;";
+        const fill = track.createDiv();
+        fill.style.cssText = `height:100%; width:${pct}%; background:var(--interactive-accent);`;
+        gw.createEl("span", { text: `🎯 ${data.total}/${goal}（${pct}%）` });
+      }
+
       // 官方收录
       const id = repo.replace(/^obsidian-/, "");
       const off = plugin.cache.official && plugin.cache.official[id];
@@ -315,11 +480,15 @@ class StatsView extends ItemView {
       // 逐版本
       const det = item.createEl("details");
       det.createEl("summary", { text: `${data.perRelease.length} 个版本明细`, attr: { style: "font-size:12px; cursor:pointer; color:var(--text-muted);" } });
+      const maxDl = Math.max(...data.perRelease.map((r) => r.downloads), 1);
       for (const r of data.perRelease) {
         const row = det.createDiv();
-        row.style.cssText = "display:flex; justify-content:space-between; font-size:12px; padding:2px 4px;";
-        row.createEl("span", { text: `${r.tag}（${r.date}）` });
-        row.createEl("span", { text: fmt(r.downloads), attr: { style: "color:var(--text-muted);" } });
+        row.style.cssText = "position:relative; display:flex; justify-content:space-between; font-size:12px; padding:2px 4px; overflow:hidden;";
+        const barBg = row.createDiv();
+        barBg.style.cssText = `position:absolute; inset:0; width:${Math.max(3, (r.downloads / maxDl) * 100)}%; background:var(--background-modifier-hover);`;
+        const lbl = row.createSpan({ text: `${r.tag}（${r.date}）` });
+        const val = row.createSpan({ text: fmt(r.downloads), attr: { style: "color:var(--text-muted);" } });
+        lbl.style.position = "relative"; val.style.position = "relative";
       }
     }
 
@@ -328,6 +497,23 @@ class StatsView extends ItemView {
     }
     contentEl.createEl("div", {
       text: `快照已存 ${days.length} 天`,
+    });
+    // 上架待办：官方目录收录清单对照
+    if (plugin.cache.allStats) {
+      const unlisted = plugin.idList().filter((id) => !plugin.cache.allStats[id]);
+      const listed = plugin.idList().filter((id) => plugin.cache.allStats[id]);
+      const todo = contentEl.createDiv();
+      todo.style.cssText = "padding:6px 8px; margin-top:6px; background:var(--background-secondary); border-radius:6px; font-size:12px;";
+      todo.createEl("div", { text: `📤 上架进度：${listed.length} 已收录 / ${plugin.idList().length} 计划`, attr: { style: "font-weight:600;" } });
+      if (unlisted.length) {
+        todo.createEl("div", {
+          text: `待提交或待过审：${unlisted.join("、")}（community.obsidian.md 提交后自动出现）`,
+          attr: { style: "color:var(--text-muted); margin-top:2px;" },
+        });
+      }
+    }
+    contentEl.createEl("div", {
+      text: "",
       attr: { style: "color:var(--text-muted); font-size:11px; margin-top:4px;" },
     });
   }
@@ -358,5 +544,16 @@ class StatsSettingTab extends PluginSettingTab {
       t.setValue(this.plugin.settings.autoSnapshot).onChange(async (v) => {
         this.plugin.settings.autoSnapshot = v; await this.plugin.saveSettings();
       }));
+    new Setting(containerEl).setName("下载目标（JSON）")
+      .setDesc('{"仓库名": 目标下载数}，如 {"obsidian-clipping-finder": 500}。面板显示进度条，达成时提醒一次')
+      .addTextArea((t) => {
+        t.setValue(this.plugin.settings.goalsJson || "{}");
+        t.inputEl.style.minHeight = "60px";
+        t.inputEl.style.fontFamily = "monospace";
+        t.onChange(async (v) => {
+          this.plugin.settings.goalsJson = v;
+          await this.plugin.saveSettings();
+        });
+      });
   }
 }
