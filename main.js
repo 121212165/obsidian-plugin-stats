@@ -178,6 +178,23 @@ module.exports = class PluginStats extends Plugin {
     }
     for (const cat of Object.keys(domains)) domains[cat].sort((a, b) => b.dl - a.dl);
     this.cache.domains = domains;
+    // 蓝海雷达：机会分 = 需求密度(领域中位/全域最大中位, 70%) + 头部分散度(1-Top1占比, 30%)
+    const opp = [];
+    for (const cat of Object.keys(domains)) {
+      const list = domains[cat];
+      if (list.length < 5) continue; // 样本太少的领域不评
+      const dls = list.map((x) => x.dl);
+      const total = dls.reduce((s, v) => s + v, 0);
+      const med = list[Math.floor(list.length / 2)].dl;
+      const top1 = list[0].dl / Math.max(1, total);
+      opp.push({ cat, n: list.length, total, med, top1, score: 0 });
+    }
+    const maxMed = Math.max(...opp.map((o) => o.med), 1);
+    for (const o of opp) {
+      o.score = Math.round(((o.med / maxMed) * 0.7 + (1 - o.top1) * 0.3) * 100);
+    }
+    opp.sort((a, b) => b.score - a.score);
+    this.cache.opportunity = opp;
   }
 
   /** 生成 Markdown 周报笔记 */
@@ -568,6 +585,47 @@ class StatsView extends ItemView {
         row.title = "点击查看该领域 Top10";
         row.onclick = () => { domainSel.value = cat; renderLb("", cat); lbWrap.open = true; };
       }
+    }
+
+    // ---- 蓝海雷达：找需求强、供给少、头部弱的领域 ----
+    const oppList = plugin.cache.opportunity;
+    if (oppList && oppList.length) {
+      const oWrap = contentEl.createDiv();
+      oWrap.style.cssText = "border:1px solid var(--background-modifier-border); border-radius:8px; padding:8px; margin-bottom:8px; font-size:12px;";
+      oWrap.createEl("div", {
+        text: "🛰 蓝海雷达 · 领域机会分（需求密度70% + 头部分散度30%，★=你已有插件）",
+        attr: { style: "font-weight:600; margin-bottom:4px;" },
+      });
+      const myDomains = new Set();
+      const metaById = {};
+      for (const e of plugin.cache.meta || []) metaById[e.id] = e;
+      for (const id of plugin.idList()) {
+        const m = metaById[id];
+        if (m && all[id]) myDomains.add(plugin.classify(m.name, m.description));
+      }
+      const maxScore = Math.max(...oppList.map((o) => o.score), 1);
+      const verdict = (o) => (o.score >= 55 ? "🌊 蓝海" : o.score >= 40 ? "⚖ 均衡" : "🔥 红海");
+      for (const o of oppList.slice(0, 10)) {
+        const row = oWrap.createDiv();
+        row.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0;";
+        row.createEl("span", {
+          text: (myDomains.has(o.cat) ? "★ " : "") + o.cat,
+          attr: { style: "width:130px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-weight:" + (myDomains.has(o.cat) ? "600" : "400") + ";" },
+        });
+        const track = row.createDiv();
+        track.style.cssText = "flex:1; height:10px; background:var(--background-secondary); border-radius:5px; overflow:hidden;";
+        const fill = track.createDiv();
+        fill.style.cssText = "height:100%; width:" + Math.max(2, (o.score / maxScore) * 100) + "%; background:" + (o.score >= 55 ? "var(--text-success)" : o.score >= 40 ? "var(--interactive-accent)" : "var(--text-faint)") + ";";
+        row.createEl("span", {
+          text: o.score + "分 " + verdict(o) + " · " + o.n + "个 · 中位" + fmt(o.med) + " · 头部占" + Math.round(o.top1 * 100) + "%",
+          attr: { style: "width:230px; text-align:right; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" },
+        });
+        row.title = o.cat + "：" + o.n + " 个插件，总下载 " + o.total + "，中位 " + o.med + "，Top1 占比 " + Math.round(o.top1 * 100) + "%。机会分=需求密度(70%)+头部分散度(30%)";
+      }
+      oWrap.createEl("div", {
+        text: "解读：中位下载高=真实需求；插件数少/头部占比低=供给不足，新插件更容易被看见。★ 是你已进入的领域，对比同分领域可判断深耕还是新开。",
+        attr: { style: "color:var(--text-muted); margin-top:4px; line-height:1.5;" },
+      });
     }
 
     // ---- 全量排行榜（搜索 + 领域筛选） ----
