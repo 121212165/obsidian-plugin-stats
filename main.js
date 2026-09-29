@@ -346,9 +346,52 @@ class StatsView extends ItemView {
       svgHost.setText("快照不足 2 天，明天开始出图");
       svgHost.style.cssText = "color:var(--text-muted); font-size:12px; padding:20px; text-align:center;";
     }
+    // ---- Hero 汇总 + 热力条 ----
+    const metric = (label, value, color) => {
+      const cell = hero.createDiv();
+      cell.style.cssText = "flex:1; text-align:center; padding:6px 4px;";
+      cell.createEl("div", { text: value, attr: { style: `font-size:18px; font-weight:700; color:${color || "var(--text-normal)"};` } });
+      cell.createEl("div", { text: label, attr: { style: "font-size:11px; color:var(--text-muted);" } });
+    };
+    const hero = contentEl.createDiv();
+    hero.style.cssText = "display:flex; background:var(--background-secondary); border-radius:10px; padding:6px; margin-bottom:8px;";
+    const gTotals = totalsByDay.map((x) => x.total);
+    const gLast = gTotals.length ? gTotals[gTotals.length - 1] : 0;
+    const gDeltas = gTotals.map((v, i) => (i ? Math.max(0, v - gTotals[i - 1]) : 0));
+    const d7sum = gDeltas.slice(-7).reduce((s, v) => s + v, 0);
+    const bestDay = gDeltas.length ? Math.max(...gDeltas) : 0;
+    const bestIdx = gDeltas.indexOf(bestDay);
+    const listedN = plugin.cache.allStats ? plugin.idList().filter((id) => plugin.cache.allStats[id]).length : 0;
+    metric("总下载", fmt(gLast), "var(--interactive-accent)");
+    metric(this.range === 0 ? "全期增量" : `近${this.range}日增量`, "+" + fmt(d7sum), "var(--text-success)");
+    metric("最高单日", gDeltas.length ? "+" + fmt(bestDay) : "—");
+    metric("峰值日", bestDay > 0 && chartDays[bestIdx] ? chartDays[bestIdx].slice(5) : "—");
+    metric("官方收录", `${listedN}/${plugin.idList().length}`);
+
+    if (allDays.length >= 3) {
+      const heat = contentEl.createDiv();
+      heat.style.cssText = "display:flex; align-items:center; gap:2px; margin-bottom:8px; flex-wrap:wrap;";
+      heat.createEl("span", { text: "近14日增量", attr: { style: "font-size:11px; color:var(--text-muted); margin-right:4px;" } });
+      const last14 = allDays.slice(-14);
+      const deltas14 = last14.map((d, i) => {
+        if (!i) return 0;
+        const prev = Object.values(histAll[last14[i - 1]] || {}).reduce((s, v) => s + (v || 0), 0);
+        const cur = Object.values(histAll[d] || {}).reduce((s, v) => s + (v || 0), 0);
+        return Math.max(0, cur - prev);
+      });
+      const hMax = Math.max(...deltas14, 1);
+      const shades = ["", "color:var(--text-muted);", "color:var(--text-normal); font-weight:600;", "color:var(--interactive-accent); font-weight:600;", "color:var(--interactive-accent); font-weight:700; background:var(--background-modifier-hover);"];
+      last14.forEach((d, i) => {
+        const level = deltas14[i] === 0 ? 0 : Math.min(4, Math.floor((deltas14[i] / hMax) * 4.999) + 1);
+        const cell = heat.createSpan({ text: d.slice(8) });
+        cell.style.cssText = "font-size:10px; padding:2px 3px; border-radius:3px; background:var(--background-secondary); " + shades[level];
+        cell.title = `${d}: +${deltas14[i]}`;
+      });
+    }
+
     const tsEl = bar.createEl("span", {
       text: plugin.cache.ts ? `更新于 ${new Date(plugin.cache.ts).toLocaleTimeString()}` : "未刷新",
-      attr: { style: "color:var(--text-muted); font-size:12px;" },
+      attr: { style: "color:var(--text-muted); font-size:12px; margin-left:auto;" },
     });
 
     // ---- 赛道概览：你的插件在官方 8000+ 插件中的位置 ----
@@ -386,6 +429,30 @@ class StatsView extends ItemView {
           line.createEl("span", { text: all[id] ? fmt(all[id].downloads || 0) : "—", attr: { style: "color:var(--text-muted);" } });
         }
       }
+
+      // 对比条形图（对数刻度：蓝=我方 灰=竞品）
+      const cmpIds = [
+        ...plugin.idList().filter((id) => all[id]).map((id) => ({ id, dl: all[id].downloads || 0, mine: true })),
+        ...watch.filter((id) => all[id]).map((id) => ({ id, dl: all[id].downloads || 0, mine: false })),
+      ];
+      if (cmpIds.length >= 2) {
+        const maxDl = Math.max(...cmpIds.map((x) => x.dl), 1);
+        const cmp = contentEl.createDiv();
+        cmp.style.cssText = "border:1px solid var(--background-modifier-border); border-radius:8px; padding:8px; margin-bottom:8px;";
+        cmp.createEl("div", { text: "⚖ 量级对比（对数刻度 · 蓝=我方 灰=竞品）", attr: { style: "font-size:11px; color:var(--text-muted); margin-bottom:4px;" } });
+        const lg = (v) => Math.log10(Math.max(10, v)) - 1;
+        const lgMax = lg(maxDl);
+        for (const x of cmpIds.sort((a, b) => b.dl - a.dl)) {
+          const row = cmp.createDiv();
+          row.style.cssText = "display:flex; align-items:center; gap:6px; margin:3px 0; font-size:11px;";
+          row.createEl("span", { text: x.id, attr: { style: `width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; ${x.mine ? "font-weight:600;" : "color:var(--text-muted);"}` } });
+          const track = row.createDiv();
+          track.style.cssText = "flex:1; height:10px; background:var(--background-secondary); border-radius:5px; overflow:hidden;";
+          const fill = track.createDiv();
+          fill.style.cssText = `height:100%; width:${Math.max(2, (lg(x.dl) / lgMax) * 100)}%; background:${x.mine ? "var(--interactive-accent)" : "var(--text-faint)"}; border-radius:5px;`;
+          row.createEl("span", { text: fmt(x.dl), attr: { style: "width:48px; text-align:right; color:var(--text-muted);" } });
+        }
+      }
     }
 
     // ---- 全量排行榜（搜索） ----
@@ -420,6 +487,7 @@ class StatsView extends ItemView {
     const repos = plugin.repoList();
     const hist = plugin.history();
     const days = Object.keys(hist).sort();
+    repos.sort((a, b) => ((plugin.cache.repos[b] || {}).total || 0) - ((plugin.cache.repos[a] || {}).total || 0));
 
     for (const repo of repos) {
       const data = plugin.cache.repos[repo];
@@ -468,9 +536,23 @@ class StatsView extends ItemView {
       offEl.style.cssText = "font-size:12px; margin:2px 0;";
       offEl.setText(off ? `🏛 官方目录已收录：${fmt(off.total)} 下载 / ${off.versions} 个版本` : "⏳ 未进官方目录（提交后自动检测）");
 
-      // 快照趋势
+      // 快照趋势 + 增长统计（日均 / 近7日 / 峰值 / 预计达标）
       const series = days.map((k) => ({ d: k, total: hist[k][repo] })).filter((x) => x.total != null);
       if (series.length >= 2) {
+        const dl = series.map((x, i) => (i ? Math.max(0, x.total - series[i - 1].total) : 0)).slice(1);
+        const avg = Math.round(dl.reduce((s, v) => s + v, 0) / dl.length);
+        const best = Math.max(...dl);
+        const win = dl.slice(-7);
+        const avg7 = Math.round(win.reduce((s, v) => s + v, 0) / Math.max(1, win.length));
+        const goal2 = plugin.goalOf(repo);
+        let eta = "";
+        if (goal2 && data.total < goal2 && avg7 > 0) {
+          const need = Math.ceil((goal2 - data.total) / avg7);
+          eta = ` · 🎯按近7日均速约 ${need} 天达标`;
+        }
+        const stat = item.createDiv();
+        stat.style.cssText = "font-size:11px; color:var(--text-muted); margin:2px 0;";
+        stat.setText(`日均 ${avg} · 近7日均 ${avg7} · 峰值 +${best}${eta}`);
         const sp = item.createDiv();
         sp.style.cssText = "font-family:monospace; font-size:13px; color:var(--text-faint); margin-top:2px;";
         sp.setText(spark(series, 60) || "");
@@ -495,6 +577,7 @@ class StatsView extends ItemView {
     if (plugin.cache.officialError) {
       contentEl.createEl("div", { text: "官方目录数据拉取失败：" + plugin.cache.officialError, attr: { style: "color:var(--text-error); font-size:12px;" } });
     }
+    contentEl.createEl("div", { text: "📦 我的插件（按下载量排序）", attr: { style: "font-weight:600; margin:8px 0 4px; font-size:13px;" } });
     contentEl.createEl("div", {
       text: `快照已存 ${days.length} 天`,
     });
