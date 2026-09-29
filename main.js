@@ -179,6 +179,7 @@ module.exports = class PluginStats extends Plugin {
     for (const cat of Object.keys(domains)) domains[cat].sort((a, b) => b.dl - a.dl);
     this.cache.domains = domains;
     // 蓝海雷达：机会分 = 需求密度(领域中位/全域最大中位, 70%) + 头部分散度(1-Top1占比, 30%)
+    const all2 = this.cache.allStats || {};
     const opp = [];
     for (const cat of Object.keys(domains)) {
       const list = domains[cat];
@@ -187,7 +188,19 @@ module.exports = class PluginStats extends Plugin {
       const total = dls.reduce((s, v) => s + v, 0);
       const med = list[Math.floor(list.length / 2)].dl;
       const top1 = list[0].dl / Math.max(1, total);
-      opp.push({ cat, n: list.length, total, med, top1, score: 0 });
+      // 增长信号：各插件最新版本吸走的下载占比（按 JSON key 顺序取最后一个版本键）的中位数
+      // 按下载量加权平均：大插件的版本结构才代表领域真实需求
+      let wSum = 0, fSum = 0;
+      for (const x of list) {
+        const st = all2[x.id] || {};
+        const verKeys = Object.keys(st).filter((k) => !["downloads", "updated"].includes(k));
+        if (!verKeys.length || !st.downloads) continue;
+        const latest = st[verKeys[verKeys.length - 1]] || 0;
+        fSum += (latest / st.downloads) * st.downloads;
+        wSum += st.downloads;
+      }
+      const fresh = wSum ? fSum / wSum : 0;
+      opp.push({ cat, n: list.length, total, med, top1, fresh, score: 0 });
     }
     const maxMed = Math.max(...opp.map((o) => o.med), 1);
     for (const o of opp) {
@@ -616,14 +629,16 @@ class StatsView extends ItemView {
         track.style.cssText = "flex:1; height:10px; background:var(--background-secondary); border-radius:5px; overflow:hidden;";
         const fill = track.createDiv();
         fill.style.cssText = "height:100%; width:" + Math.max(2, (o.score / maxScore) * 100) + "%; background:" + (o.score >= 55 ? "var(--text-success)" : o.score >= 40 ? "var(--interactive-accent)" : "var(--text-faint)") + ";";
+        const freshPct = Math.round((o.fresh || 0) * 100);
+        const freshSig = freshPct >= 30 ? "🟢 增长" : freshPct >= 12 ? "🟡 平稳" : "🔴 停滞";
         row.createEl("span", {
-          text: o.score + "分 " + verdict(o) + " · " + o.n + "个 · 中位" + fmt(o.med) + " · 头部占" + Math.round(o.top1 * 100) + "%",
-          attr: { style: "width:230px; text-align:right; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" },
+          text: o.score + "分 " + verdict(o) + " · " + o.n + "个 · 中位" + fmt(o.med) + " · 头部占" + Math.round(o.top1 * 100) + "% · " + freshSig + freshPct + "%",
+          attr: { style: "width:290px; text-align:right; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" },
         });
-        row.title = o.cat + "：" + o.n + " 个插件，总下载 " + o.total + "，中位 " + o.med + "，Top1 占比 " + Math.round(o.top1 * 100) + "%。机会分=需求密度(70%)+头部分散度(30%)";
+        row.title = o.cat + "：" + o.n + " 个插件，总下载 " + o.total + "，中位 " + o.med + "，Top1 占比 " + Math.round(o.top1 * 100) + "%。增长信号=领域内插件最新版本下载占比中位（新版还能吸走 " + freshPct + "% 的下载）。机会分=需求密度(70%)+头部分散度(30%)";
       }
       oWrap.createEl("div", {
-        text: "解读：中位下载高=真实需求；插件数少/头部占比低=供给不足，新插件更容易被看见。★ 是你已进入的领域，对比同分领域可判断深耕还是新开。",
+        text: "解读：中位下载高=真实需求；插件数少/头部占比低=供给不足，新插件更容易被看见。增长信号🟢=新版仍能吸走≥30%下载（需求在涨，进场有好窗口）；🔴=存量固化（新版没人下，做新插件很难被需要）。★ 是你已进入的领域。",
         attr: { style: "color:var(--text-muted); margin-top:4px; line-height:1.5;" },
       });
     }
