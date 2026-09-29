@@ -38,7 +38,11 @@ function spark(history, width) {
 
 module.exports = class PluginStats extends Plugin {
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // data.json 结构：{ settings: {...}, snapshot: {date: {repo: total}} }；
+    // 兼容旧版直接存 settings 的格式。全新安装 loadData() 返回 null，必须兜底。
+    const saved = (await this.loadData()) || {};
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved.settings || saved);
+    this.snapshots = saved.snapshot || {};
     this.cache = { repos: {}, official: null, ts: 0 };
 
     this.addRibbonIcon("line-chart", "插件下载看板", () => this.openView());
@@ -51,18 +55,23 @@ module.exports = class PluginStats extends Plugin {
     // 每天首次启动静默快照（不阻塞加载）
     if (this.settings.autoSnapshot) {
       const today = new Date().toISOString().slice(0, 10);
-      const last = Object.keys(this.data.snapshot || {}).sort().pop();
+      const last = Object.keys(this.snapshots).sort().pop();
       if (last !== today) {
         setTimeout(() => this.refreshAll().then(() => this.rerenderViews()).catch(() => {}), 8000);
       }
     }
   }
   onunload() { this.app.workspace.detachLeavesOfType(VIEW_TYPE); }
-  async saveSettings() { await this.saveData(this.settings); }
+
+  /** settings 与 snapshot 合并落盘，避免两处互相覆盖 */
+  async saveState() {
+    await this.saveData({ settings: this.settings, snapshot: this.snapshots });
+  }
+  async saveSettings() { await this.saveState(); }
 
   /** 快照历史导出 CSV */
   exportSnapshots() {
-    const snap = this.data.snapshot || {};
+    const snap = this.snapshots;
     const days = Object.keys(snap).sort();
     const repoKeys = [...new Set(days.flatMap((d) => Object.keys(snap[d])))];
     const rows = [["date", ...repoKeys].join(",")];
@@ -92,17 +101,17 @@ module.exports = class PluginStats extends Plugin {
   idList() { return this.settings.pluginIds.split(",").map((s) => s.trim()).filter(Boolean); }
 
   /** 快照历史：{date: {repoKey: total}} */
-  history() { return this.data.snapshot || {}; }
+  history() { return this.snapshots || {}; }
 
   async saveSnapshot(totals) {
     const today = new Date().toISOString().slice(0, 10);
-    const snapshot = Object.assign({}, this.data.snapshot || {});
+    const snapshot = Object.assign({}, this.snapshots || {});
     snapshot[today] = Object.assign({}, snapshot[today] || {}, totals);
     // 只留最近 120 天
     const days = Object.keys(snapshot).sort();
     while (days.length > 120) delete snapshot[days.shift()];
-    this.data.snapshot = snapshot;
-    await this.saveData(this.data);
+    this.snapshots = snapshot;
+    await this.saveState();
   }
 
   async refreshAll() {
