@@ -86,6 +86,7 @@ module.exports = class PluginStats extends Plugin {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, saved.settings || saved);
     this.snapshots = saved.snapshot || {};
     this.etags = saved.etags || {};        // ETag 缓存，省 GitHub API 配额
+    this.lastTotals = saved.lastTotals || {}; // 最近一次成功拉取的各仓库总量（跨启动，防 304 冷启动空快照）
     this.achieved = saved.achieved || {};  // 已达成目标的仓库
     this.cache = { repos: {}, official: null, ts: 0 };
 
@@ -115,7 +116,7 @@ module.exports = class PluginStats extends Plugin {
 
   /** settings 与 snapshot 合并落盘，避免两处互相覆盖 */
   async saveState() {
-    await this.saveData({ settings: this.settings, snapshot: this.snapshots, etags: this.etags, achieved: this.achieved });
+    await this.saveData({ settings: this.settings, snapshot: this.snapshots, etags: this.etags, achieved: this.achieved, lastTotals: this.lastTotals });
   }
 
   /** 带条件请求的 JSON 拉取：304 时返回 null（调用方沿用缓存） */
@@ -319,12 +320,28 @@ module.exports = class PluginStats extends Plugin {
 
   async saveSnapshot(totals) {
     const today = new Date().toISOString().slice(0, 10);
+    // 空快照防护（issue#1）：本轮一个仓库都没拿到（304 冷启动/断网）时，
+    // 沿用最近一次成功总量而不是落 {}；首次且无历史则跳过本次落盘
+    const repoList = this.repoList();
+    const got = Object.keys(totals || {}).filter((k) => repoList.includes(k));
+    if (!got.length && repoList.length) {
+      if (Object.keys(this.lastTotals || {}).length) {
+        totals = Object.assign({}, this.lastTotals);
+      } else {
+        console.warn("[plugin-stats] 全部拉取失败，跳过本次快照落盘");
+        return;
+      }
+    }
     const snapshot = Object.assign({}, this.snapshots || {});
     snapshot[today] = Object.assign({}, snapshot[today] || {}, totals);
-    // 只留最近 120 天
+    // 只留最近 120 天（同时清理历史遗留的空对象，如 2026-10-04）
+    for (const d of Object.keys(snapshot)) {
+      if (!snapshot[d] || !Object.keys(snapshot[d]).length) delete snapshot[d];
+    }
     const days = Object.keys(snapshot).sort();
     while (days.length > 120) delete snapshot[days.shift()];
     this.snapshots = snapshot;
+    this.lastTotals = Object.assign({}, totals);
     await this.saveState();
   }
 
@@ -336,9 +353,10 @@ module.exports = class PluginStats extends Plugin {
           `https://api.github.com/repos/${this.settings.owner}/${repo}/releases?per_page=100`,
           "gh:" + repo
         );
-        if (!releases) { // 304：沿用缓存
+        if (!releases) { // 304：沿用缓存（冷启动时内存缓存为空 → 回退跨启动 lastTotals）
           const old = this.cache.repos[repo];
           if (old && old.total != null) totals[repo] = old.total;
+          else if (this.lastTotals && this.lastTotals[repo] != null) totals[repo] = this.lastTotals[repo];
           continue;
         }
         const perRelease = releases.map((r) => ({
